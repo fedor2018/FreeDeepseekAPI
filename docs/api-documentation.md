@@ -121,6 +121,8 @@ loopback origins and the exact origins listed in `PROXY_CORS_ORIGINS`.
 | `GET` | `/v1/sessions` | Active agent sessions |
 | `POST` | `/reset-session?agent=<id>` | Drop one agent's remote chat (local history kept) |
 | `POST` | `/reset-session?agent=all` | Drop all sessions |
+| `POST` | `/delete-session?agent=<id>` | Hard-delete one agent's local session entry |
+| `POST` | `/delete-session?agent=all` | Hard-delete all local session entries |
 
 ### 3.1 Chat Completions
 
@@ -239,7 +241,19 @@ GET /v1/sessions
 
 POST /reset-session?agent=dev-agent
 → {"status": "session_reset", "agent": "dev-agent", "history_preserved": 2, "history": "..."}
+
+POST /delete-session?agent=dev-agent
+→ {"status": "session_deleted", "agent": "dev-agent"}
+
+POST /delete-session?agent=all
+→ {"status": "all_sessions_deleted", "count": 1}
 ```
+
+`/reset-session` keeps the local entry as a tombstone (`session_id: null`) so
+history and the sticky account survive. `/delete-session` removes the entry
+completely. DeepSeek Web exposes a delete endpoint (`POST /api/v0/chat_session/delete`) —
+when a valid sticky account exists, the remote chat is removed upstream too
+(fire-and-forget, `remote_deleted: 'pending'` until the delete resolves).
 
 A chat message whose text is exactly `/new` resets the agent's session and
 history without calling DeepSeek.

@@ -94,6 +94,8 @@ async function main(args = process.argv.slice(2)) {
   const port = process.env.PORT || 9655;
   const keyHeader = process.env.PROXY_API_KEY || process.env.PROXY_API_KEY_FILE ? ' -H "Authorization: Bearer $PROXY_API_KEY"' : '';
   console.log(`Reset: curl -X POST${keyHeader} "http://localhost:${port}/reset-session?agent=all"`);
+  console.log(`Delete: curl -X POST${keyHeader} "http://localhost:${port}/delete-session?agent=<id>" (fire-and-forget, remote_deleted:'pending');`);
+  console.log(`Delete All: curl -X POST${keyHeader} "http://localhost:${port}/delete-session?agent=all"`);
   console.log('VPS: import auth on server, then run NON_INTERACTIVE=1 npm start');
   return ok ? 0 : 2;
 }

@@ -417,6 +417,35 @@ curl -X POST "http://localhost:9655/reset-session?agent=my-agent"
 curl -X POST "http://localhost:9655/reset-session?agent=all"
 ```
 
+Сбросить одну session:
+
+```bash
+curl -X POST "http://localhost:9655/reset-session?agent=my-agent"
+```
+
+Сбросить все sessions:
+
+```bash
+curl -X POST "http://localhost:9655/reset-session?agent=all"
+```
+
+Удалить session из локального реестра (reset оставляет tombstone-запись):
+
+```bash
+curl -X POST "http://localhost:9655/delete-session?agent=my-agent"
+curl -X POST "http://localhost:9655/delete-session?agent=all"
+```
+
+`/delete-session` удаляет запись из реестра. Если для сессии есть sticky-аккаунт,
+вызывается `deleteRemoteChat` (DeepSeek `POST /api/v0/chat_session/delete`) — удаление
+происходит fire-and-forget, в ответе `remote_deleted: 'pending'`. Tombstone-запись
+(`session_id: null`) не остаётся — запись удаляется сразу.
+
+`/delete-session` работает только на прокси, собранном из этих исходников: после
+обновления кода контейнер нужно пересобрать и перезапустить, иначе endpoint
+вернёт `404`. Уже сброшенная запись (`session_id: null`) удаляется idle sweep
+(`SESSION_TTL_MS * 2`) или рестартом прокси.
+
 Почему чаты всё равно появляются в DeepSeek Web: proxy работает через внутренний Web Chat API, а DeepSeek хранит реальные chat sessions у себя. Это нормально для web-proxy. Задача session reuse — не плодить новые чаты без необходимости и аккуратно сбрасываться только когда chain протух/сломался.
 
 ---
@@ -701,6 +730,8 @@ curl http://localhost:9655/v1/model-capabilities
 | `GET` | `/v1/sessions` | активные локальные agent sessions |
 | `POST` | `/reset-session?agent=<id>` | сбросить одну session |
 | `POST` | `/reset-session?agent=all` | сбросить все sessions |
+| `POST` | `/delete-session?agent=<id>` | удалить одну session из реестра |
+| `POST` | `/delete-session?agent=all` | удалить все sessions из реестра |
 
 ---
 

@@ -129,6 +129,21 @@ async function* readStreamWithTimeouts(resp) {
     }
 }
 
+async function deleteRemoteChat(account, chatId) {
+    if (!account || !account.headers || !chatId) return false;
+    try {
+        const url = dsUrl('/api/v0/chat_session/delete');
+        await dsFetch(url, {
+            method: 'POST',
+            headers: account.headers,
+            body: JSON.stringify({ chat_session_id: chatId }),
+        });
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
     try {
@@ -2669,6 +2684,39 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Hard-delete an agent session from the local registry AND remote DeepSeek chat.
+    // DeepSeek Web has a delete endpoint — if we have a valid account, the chat is removed upstream too.
+    if (req.method === 'POST' && url.pathname === '/delete-session') {
+        const agentId = url.searchParams.get('agent');
+        if (!agentId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing agent parameter (use agent=<id> or agent=all)' }));
+            return;
+        }
+        if (agentId === 'all') {
+            const count = sessions.size;
+            sessions.clear();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'all_sessions_deleted', count }));
+            return;
+        }
+        if (!sessions.has(agentId)) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `No session for agent: ${agentId}` }));
+            return;
+        }
+        const session = sessions.get(agentId);
+        const account = accounts.find(a => a.id === session.accountId);
+        const remoteDeleted = account ? 'pending' : false;
+        if (account) {
+            deleteRemoteChat(account, session.id);
+        }
+        sessions.delete(agentId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'session_deleted', agent: agentId, remote_deleted: remoteDeleted }));
+        return;
+    }
+
     const apiMode = url.pathname === '/v1/messages'
         ? 'anthropic'
         : (url.pathname === '/v1/responses' ? 'responses' : 'openai');
@@ -3395,6 +3443,8 @@ async function main() {
         console.log('[DS-API] GET  /v1/sessions — list active agent sessions');
         console.log('[DS-API] POST /reset-session?agent=<id> — reset agent session');
         console.log('[DS-API] POST /reset-session?agent=all — reset ALL sessions');
+        console.log('[DS-API] POST /delete-session?agent=<id> — hard-delete agent session');
+        console.log('[DS-API] POST /delete-session?agent=all — hard-delete ALL sessions');
     });
 }
 
