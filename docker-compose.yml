@@ -1,0 +1,138 @@
+# Локальний запуск FreeDeepseekAPI через Docker — один сервіс.
+#
+# Логіка в entrypoint.sh (точка входу образу):
+#   1. /data/deepseek-auth.json валідний → одразу проксі.
+#   2. Немає → Xvfb + openbox + x11vnc + Chromium, вхід вручну через VNC.
+#      ENTER натискати не треба: DEEPSEEK_AUTO_AUTH=1 перемикає скрипт
+#      в авто-режим (опитування браузера до появи token+cookie, до ~15 хв).
+#   3. auth ok → wait 5s → Chromium і X-стек закриваються → exec node server.js.
+#
+# Запуск (можна detached, TTY не потрібен):
+#   1) задайте VNC_PASSWORD і PROXY_API_KEY у .env
+#   2) docker compose up -d --build
+#   3) якщо auth ще немає: підключіться VNC-клієнтом до 9655, увійдіть
+#      у DeepSeek, надішліть коротке повідомлення (напр. ok) — далі все само.
+#      VNC і проксі ділять порт 9655 послідовно: під час входу там VNC,
+#      після — проксі.
+#   4) docker compose logs -f   → "[auth] Saved: ..." або одразу проксі.
+#      Після успішного входу контейнер САМ перезапускається (це нормально:
+#      restart: unless-stopped) і стартує вже одразу в проксі з чистим станом.
+#   5) curl http://<host>:9655/health
+#
+# ⚠ Порти відкрито на всіх інтерфейсах (без 127.0.0.1): проксі видно мережі.
+# PROXY_API_KEY опціональний — без нього працює без автентифікації
+# (REQUIRE_PROXY_API_KEY=0). Для мережі краще задати ключ у .env.
+# VNC так само в LAN: без VNC_PASSWORD він буде БЕЗ пароля
+# (попередження в лозі), тож для мережі задайте довгий пароль.
+# Порт 9334 (Chrome DevTools) свідомо НЕ публікується: CDP без автентифікації
+# = повний контроль над браузером.
+#
+# ⚠ Ротація auth під час роботи проксі вимагає рестарту.
+# Конфіг читається рівно один раз на старті (server.js:306): ані fs.watch,
+# ані SIGHUP, ані ендпоінта reload у сервері немає. Тому після повторного
+# входу видаліть ./data/deepseek-auth.json і перезапустіть:
+#   docker compose restart free-deepseek-api
+# Без цього проксі працюватиме зі старим токеном, а єдиний акаунт після 401
+# піде в cooldown 10 хв (server.js:283-289, DEEPSEEK_ACCOUNT_COOLDOWN_MS)
+# і /readyz повертатиме 503, попри те що auth-файл оновлено.
+#
+# Образ НЕ містить auth-файлів і ключів — усе передається при запуску.
+services:
+  free-deepseek-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+      args:
+        # Код береться з GitHub, а не з локального дерева. entrypoint.sh —
+        # виняток: копіюється з build-контексту (див. Dockerfile).
+        # Для відтворюваної збірки вкажіть тут повний SHA замість HEAD.
+        GIT_REF: "HEAD"
+        # REPO_URL: "https://github.com/ForgetMeAI/FreeDeepseekAPI.git"
+    image: free-deepseek-api:latest
+    container_name: free-deepseek-api
+    restart: unless-stopped
+
+    # Без 127.0.0.1: видно мережі. Один порт 9655 на дві фази: під час входу
+    # там VNC (x11vnc -rfbport 9655), після — проксі. Конфлікту немає, бо
+    # entrypoint гасить X-стек і чекає звільнення порту до старту сервера.
+    ports:
+      - "9655:9655"
+
+    # Chromium працює на файловій системі і йому потрібен нормальний /dev/shm.
+    shm_size: "1gb"
+
+    # .env читається, якщо існує (Compose >= 2.24). Скопіюйте .env.example → .env
+    # і задайте там PROXY_API_KEY і VNC_PASSWORD — вони потраплять
+    # у контейнер, але не в образ. Файлу .env у репозиторії немає (.gitignore).
+    # VNC_PASSWORD береться з .env, а не з environment — щоб у compose
+    # не було рядка з секретом.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "9655"
+      NON_INTERACTIVE: "1"
+      DEEPSEEK_AUTH_PATH: "/data/deepseek-auth.json"
+      # Мульти-акаунтний пул: DEEPSEEK_AUTH_DIR має пріоритет над
+      # DEEPSEEK_AUTH_PATH, тому каталог має існувати — інакше пул буде порожнім.
+      # DEEPSEEK_AUTH_DIR: "/data/accounts"
+      # Ключ проксі опціональний: без PROXY_API_KEY працює без автентифікації.
+      # Увага: порти відкрито в мережу, тож без ключа API доступний всім у LAN.
+      REQUIRE_PROXY_API_KEY: "0"
+      # Не задавайте PROXY_API_KEY_FILE, якщо не монструєте compose secrets.
+      # ── Фаза авторизації (entrypoint.sh) ──
+      DISPLAY: ":99"
+      # HOME в /data: Chromium пише у ~/.config та ~/.cache.
+      HOME: "/data/home"
+      CHROME_PATH: "/usr/local/bin/chromium-wrapper"
+      DEEPSEEK_CHROME_PROFILE: "/data/chrome-profile"
+      # Профіль зберігаємо, щоб не проходити логін щоразу.
+      DEEPSEEK_KEEP_CHROME_PROFILE: "1"
+      # Авто-режим без ENTER: опитування браузера до token+cookie (до ~15 хв).
+      DEEPSEEK_AUTO_AUTH: "1"
+
+    # Bind mount: deepseek-auth.json, профіль Chromium і логи видно на хості
+    # як ./data/*. Каталог має належати UID 1000:
+    #   mkdir -p data && chown 1000:1000 data
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+
+    # server.js не пише жодного файлу на диск, але фазі авторизації потрібні
+    # записи Chromium ($HOME) і сокети X-сервера (/tmp), тому коренева ФС
+    # лишається read-only, а /tmp винесено в tmpfs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Ліміти під фазу авторизації: Chromium піднімає десятки процесів.
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # HEALTHCHECK вже присутній у Dockerfile — compose успадковує його
+    # (перевіряє /health раз на 30с). Під час фази авторизації проксі ще
+    # не запущено, тому unhealthy — правильний стан, а не помилка.
+    stop_grace_period: 15s
+
+# Альтернатива PROXY_API_KEY у змінних — compose secrets.
+# Розкоментуйте блок нижче, створіть файл ключа і додайте в сервіс вище:
+#   PROXY_API_KEY_FILE: "/run/secrets/proxy-api-key"
+#   secrets:
+#     - proxy-api-key
+# secrets:
+#   proxy-api-key:
+#     file: ./proxy-api-key.txt

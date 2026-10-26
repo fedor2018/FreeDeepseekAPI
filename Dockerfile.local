@@ -1,0 +1,124 @@
+# Dockerfile.local — збірка без git fetch.
+# Бстане на тому ж рантайм-етапі, що й Dockerfile, але вихідні файли
+# копіюються напряму з build-контексту (локальний checkout), а не з GitHub.
+#
+# Збірка:
+#   docker build --tag localhost/free-deepseek-api:local --file Dockerfile.local .
+#   podman build --format docker --tag localhost/free-deepseek-api:local --file Dockerfile.local .
+#
+# Безпека: наведений нижче список COPY — allow-list. Auth-файли
+# (deepseek-auth.json, deepseek-accounts.json, proxy-api-key.txt),
+# браузерні профілі та інше сміття checkout'у в образ не потрапляють,
+# навіть якщо лежать поруч у робочому каталозі.
+#
+# Аргументи узгоджені з Dockerfile (спадкуються через --build-arg, якщо
+# потрібно прибрати відповідний тег): NODE_IMAGE — той самий базовий
+# образ (node:22-bookworm-slim за замовчуванням).
+
+ARG NODE_IMAGE=docker.io/library/node:22-bookworm-slim
+
+# ── Рантайм ─────────────────────────────────────────────────────────────
+FROM ${NODE_IMAGE} AS runtime
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=9655 \
+    NON_INTERACTIVE=1 \
+    DEEPSEEK_AUTH_PATH=/data/deepseek-auth.json
+
+WORKDIR /app
+
+# Стек для сервісу авторизації: Xvfb (віртуальний дисплей), x11vnc (VNC-доступ
+# ззовнішнього клієнта), openbox (фокус вікна), chromium (вхід у chat.deepseek.com).
+# Столь самий набір і версії, що в Dockerfile, — щоб локальна збірка не
+# відрізнялася поведінкою від git-збірки.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      chromium \
+      xvfb \
+      x11vnc \
+      openbox \
+      procps \
+      fonts-liberation \
+      fonts-wqy-zenhei \
+ && rm -rf /var/lib/apt/lists/*
+
+# Обгортка Chromium — той самий паттерн, що в Dockerfile: auth-скрипт
+# формує argv самостійно, прапорці передати ззовні неможливо.
+# --disable-dev-shm-usage обовʼязковий: /dev/shm у Docker — 64 МБ.
+# --no-sandbox відмикає ізоляцію рендерера; SUID-варіант не працює разом із
+# no-new-privileges/cap_drop.
+RUN printf '%s\n' \
+ '#!/bin/sh' \
+ '# Обгортка Chromium для контейнера. Прапорці передати через оточення не можна:' \
+ '# auth-скрипт формує argv самостійно.' \
+ 'LOG=/data/chrome.log' \
+ 'mkdir -p /data && touch "$LOG" && chmod 0666 "$LOG" || LOG=/dev/null' \
+ 'for candidate in /usr/lib/chromium/chromium /usr/bin/chromium /usr/lib/chromium-browser/chromium-browser; do' \
+ '  [ -x "$candidate" ] && break' \
+ 'done' \
+ 'if [ ! -x "$candidate" ]; then' \
+ '  echo "chromium not found in image" >> "$LOG"' \
+ '  ls -la /usr/lib/chromium /usr/bin/chromium* >> "$LOG" 2>&1' \
+ '  exit 127' \
+ 'fi' \
+ 'exec "$candidate" --no-sandbox --disable-dev-shm-usage --disable-gpu --window-size=1400,900 "$@" >>"$LOG" 2>&1' \
+ > /usr/local/bin/chromium-wrapper \
+ && chmod 0755 /usr/local/bin/chromium-wrapper
+
+# FreeDeepseekAPI не має npm-залежностей. Копіюємо лише allow-list —
+# уже з локального контексту, без git.
+COPY --chown=1000:1000 package.json server.js ./
+COPY --chown=1000:1000 lib/pow.js lib/env.js ./lib/
+COPY --chown=1000:1000 scripts/deepseek_chrome_auth.js ./scripts/
+COPY --chown=1000:1000 entrypoint.sh ./entrypoint.sh
+
+# Варіант A: автоматичний режим без ENTER (DEEPSEEK_AUTO_AUTH=1) — той самий
+# патч, що в Dockerfile. Збірка впаде, якщо upstream змінив скрипт (якір
+# не знайдено), — правиться вручну.
+RUN node <<'EOF'
+const fs = require('fs');
+const f = 'scripts/deepseek_chrome_auth.js';
+const s = fs.readFileSync(f, 'utf8');
+if (s.includes('DEEPSEEK_AUTO_AUTH')) {
+    console.log('AUTO patch: already present, skipping');
+    process.exit(0);
+}
+const anchor = `    await ask(
+        '[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ',
+    );`;
+if (!s.includes(anchor)) {
+    console.error('AUTO patch: anchor not found, upstream script changed');
+    process.exit(1);
+}
+const repl = `    if (/^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_AUTO_AUTH || '')) {
+        console.log('[auth] AUTO mode: waiting for login without ENTER (up to ~15 min)...');
+        for (let autoI = 0; autoI < 180; autoI++) {
+            try {
+                const probe = await readPageAuth(cdp);
+                if (probe.token && probe.cookie) break;
+            } catch {}
+            await sleep(5000);
+        }
+    } else {
+        await ask(
+            '[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ',
+        );
+    }`;
+fs.writeFileSync(f, s.replace(anchor, repl));
+console.log('AUTO patch applied');
+EOF
+
+# Каталог для auth-файлів, доступний non-root користувачу (volume у compose).
+RUN mkdir -p /data && chown 1000:1000 /data \
+ && chmod 0755 /app/entrypoint.sh
+
+USER 1000:1000
+
+# Один порт 9655 на дві послідовні фази: VNC під час входу, проксі після.
+EXPOSE 9655
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["node", "-e", "const http=require('http');const req=http.get({host:'127.0.0.1',port:process.env.PORT||9655,path:'/health'},res=>{res.resume();process.exit(res.statusCode===200?0:1)});req.on('error',()=>process.exit(1));req.setTimeout(4000,()=>{req.destroy();process.exit(1)})"]
+
+ENTRYPOINT ["/app/entrypoint.sh"]
