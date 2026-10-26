@@ -437,9 +437,15 @@ curl -X POST "http://localhost:9655/delete-session?agent=all"
 ```
 
 `/delete-session` удаляет запись из реестра. Если для сессии есть sticky-аккаунт,
-вызывается `deleteRemoteChat` (DeepSeek `POST /api/v0/chat_session/delete`) — удаление
-происходит fire-and-forget, в ответе `remote_deleted: 'pending'`. Tombstone-запись
+вызывается `deleteRemoteChat` (DeepSeek `POST /api/v0/chat_session/delete`) и ответ
+честный: `remote_deleted: 'deleted' | 'failed' | 'skipped'`. Tombstone-запись
 (`session_id: null`) не остаётся — запись удаляется сразу.
+
+Orphan-чаты («рассыпанные» remote-чаты в DeepSeek-аккаунте) теперь прибираются
+на всех путях rollover: session reset по TTL/лимиту контекста, account rotation,
+`/new`, idle sweep и `/delete-session?agent=all` вызывают `deleteRemoteChat` для
+ предыдущего `chat_session_id`. Отключается переменной окружения
+`DEEPSEEK_DISABLE_ORPHAN_CLEANUP=1` (например, для offline-тестов).
 
 `/delete-session` работает только на прокси, собранном из этих исходников: после
 обновления кода контейнер нужно пересобрать и перезапустить, иначе endpoint

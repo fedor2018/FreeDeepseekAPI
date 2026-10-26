@@ -10,8 +10,13 @@ describe('deleteRemoteChat and /delete-session', () => {
   });
 
   it('session deletion response format is correct (contract check)', () => {
-    const response = { status: 'session_deleted', agent: 'dev-agent', remote_deleted: 'pending' };
-    assert.strictEqual(response.status, 'session_deleted');
-    assert.strictEqual(response.remote_deleted, 'pending');
+    // remote_deleted is truthful now: 'deleted' | 'failed' | 'skipped'
+    // (the old 'pending' could never be trusted: the remote call was
+    // fire-and-forget and its outcome was silently swallowed).
+    for (const value of ['deleted', 'failed', 'skipped']) {
+      const response = { status: 'session_deleted', agent: 'dev-agent', remote_deleted: value };
+      assert.strictEqual(response.status, 'session_deleted');
+      assert.ok(['deleted', 'failed', 'skipped'].includes(response.remote_deleted), value);
+    }
   });
 });

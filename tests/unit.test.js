@@ -1023,3 +1023,59 @@ test('systemd unit runs unprivileged, non-interactive and fail-closed', () => {
   // Node's JIT needs writable+executable memory.
   assert.doesNotMatch(unit, /^MemoryDenyWriteExecute=true$/m);
 });
+
+test('planSessionTurn continues the remote chat when the client trims earlier history', () => {
+  const userHello = { role: 'user', content: 'hello' };
+  const toolOut = (c1) => ({ role: 'tool', tool_call_id: 'c1', content: 'out' });
+  const echoTurn = (c1) => ({
+    role: 'assistant',
+    content: null, // client echo may rewrite the assistant content field
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'ls', arguments: '{}' } }],
+  });
+  const session = serverInternals.createSession();
+  session.id = 'chat';
+  session.contextKey = 'ctx';
+
+  // The remote chat holds one turn: user 'hello' + the DeepSeek answer.
+  session.sentMessageKeys = [serverInternals.conversationMessageKey(userHello)];
+
+  // OpenCode tools flow: the client echoes the assistant turn (rewritten
+  // content) in front of the tool result — continuity must be recognized and
+  // only the new messages go upstream.
+  const leadEcho = serverInternals.planSessionTurn(session, [
+    userHello,
+    echoTurn(),
+    toolOut(),
+    { role: 'user', content: 'дій далі' },
+  ], 'ctx');
+  assert.equal(leadEcho.mode, 'delta', 'echoed assistant turn must not restart the chat');
+  assert.deepEqual(leadEcho.messages.map(m => m.role), ['tool', 'user']);
+
+  // A client that trimmed the very first user message keeps the same chat:
+  // the leading echo is followed by a confirmed tool result, the walk starts
+  // the delta at the first genuinely new message.
+  const trimmed = serverInternals.planSessionTurn(session, [
+    echoTurn(),
+    toolOut(),
+    { role: 'user', content: 'дій далі' },
+  ], 'ctx');
+  assert.equal(trimmed.mode, 'full', 'a client that dropped the tracked anchor cannot prove continuity (safe full)');
+
+  // Latest-only flow: no assistant message in the request at all → delta.
+  const latestOnly = serverInternals.planSessionTurn(session, [
+    { role: 'user', content: 'а тепер?' },
+  ], 'ctx');
+  assert.equal(latestOnly.mode, 'delta');
+});
+
+
+test('stableSystemFingerprint ignores volatile agent decoration', () => {
+  const fp = serverInternals.stableSystemFingerprint;
+  const staticPart = 'You are a code agent. Tools follow.';
+  const fresh = fp(`${staticPart}\nToday: ${new Date().toISOString()} (UTC)`);
+  const stale = fp(`${staticPart}\nToday: 2020-01-01T00:00:00Z (UTC)`);
+  assert.equal(fresh, stale, 'ISO dates must not change the fingerprint');
+  assert.equal(fp(`${staticPart}\nRun id f47ac10b-58cc-4372-a567-0e02b2c3d479`), fp(`${staticPart}\nRun id 9999aaaa-1111-4372-a567-0e02b2c3d479`), 'UUIDs must not change the fingerprint');
+  assert.notEqual(fp(staticPart), fp(`${staticPart}\nTotally different persona`), 'real content changes still matter');
+  assert.equal(fp(undefined), fp(''), 'missing system prompt is an empty fingerprint');
+});

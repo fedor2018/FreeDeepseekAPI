@@ -133,16 +133,23 @@ async function deleteRemoteChat(account, chatId) {
     if (!account || !account.headers || !chatId) return false;
     try {
         const url = dsUrl('/api/v0/chat_session/delete');
-        await dsFetch(url, {
+        const sr = await dsFetch(url, {
             method: 'POST',
             headers: account.headers,
             body: JSON.stringify({ chat_session_id: chatId }),
         });
-        return true;
+        // 200 = deleted; 404 = the chat is already gone, which is the same
+        // outcome. Any other status (401 expiry, 429 throttle, 5xx) means the
+        // chat may still linger in the account: report failure, not success.
+        return sr.ok || sr.status === 404;
     } catch (e) {
         return false;
     }
 }
+
+// Orphan-cleanup kill switch: offline test runs must not poke the real
+// DeepSeek endpoint from retireRemoteChatById.
+const ORPHAN_CLEANUP_ENABLED = process.env.DEEPSEEK_DISABLE_ORPHAN_CLEANUP !== '1';
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -489,10 +496,27 @@ function createSession() {
         // follow-up request send only its new messages (see planSessionTurn).
         sentMessageKeys: [],
         contextKey: null,
+        // Raw system prompt hash: even when the stable fingerprint says the
+        // remote chat may stay, a raw change must travel along in the next
+        // delta (that is what includesSystem compares).
+        contextRawKey: null,
         // Approximate size of everything the remote chat holds.
         remoteChars: 0,
         busy: false,
     };
+}
+
+// A rollover (_ttl, depth, context overflow, tool-protocol reset, account
+// rotation, idle sweep) abandons the previous remote chat. Without this call,
+// every rollover would leave the chat behind in the DeepSeek account as an
+// orphan. Fire-and-forget: rollover paths are synchronous and must not stall
+// the request on a cleanup round-trip.
+function retireRemoteChatById(chatId, accountId, agentTag = '[DS-API]', reason = 'rollover') {
+    if (!chatId || !accountId || !ORPHAN_CLEANUP_ENABLED) return;
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) return;
+    deleteRemoteChat(account, chatId)
+        .then(ok => console.log(`${agentTag} Retired DeepSeek chat ${chatId} (${reason}): ${ok ? 'remote deleted' : 'remote delete FAILED — orphan possible'}`));
 }
 
 function resetRemoteSession(session) {
@@ -501,12 +525,14 @@ function resetRemoteSession(session) {
         failedMessageCount: session.messageCount,
         accountId: session.accountId,
     };
+    retireRemoteChatById(session.id, session.accountId, '[DS-API]', 'session reset');
     session.id = null;
     session.parentMessageId = null;
     session.createdAt = null;
     session.messageCount = 0;
     session.sentMessageKeys = [];
     session.contextKey = null;
+    session.contextRawKey = null;
     session.remoteChars = 0;
     // Keep local recovery history and the sticky account assignment. A remote
     // chat can be unhealthy without invalidating either of those local hints.
@@ -538,7 +564,11 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
     const now = Date.now();
     let removed = 0;
     for (const [agentId, session] of sessions) {
-        if (now - (session.lastActivityAt || 0) > maxIdleMs) { sessions.delete(agentId); removed++; }
+        if (now - (session.lastActivityAt || 0) > maxIdleMs) {
+            retireRemoteChatById(session.id, session.accountId, `[${agentId}]`, 'idle sweep');
+            sessions.delete(agentId);
+            removed++;
+        }
     }
     if (removed) console.log(`[DS-API] swept ${removed} idle session(s); ${sessions.size} remain`);
     return removed;
@@ -848,6 +878,7 @@ async function createRemoteChat(session, account, agentTag, label = 'session cre
     session.messageCount = 0;
     session.sentMessageKeys = [];
     session.contextKey = null;
+    session.contextRawKey = null;
     session.remoteChars = 0;
     console.log(`${agentTag} Created new session: ${session.id}`);
 }
@@ -2511,6 +2542,26 @@ function hashText(value) {
     return crypto.createHash('sha256').update(String(value)).digest('base64');
 }
 
+// Agents weave volatile decoration into the system prompt of every request
+// (today's date, wall-clock time, run ids). Hashing it raw made
+// planSessionTurn classify the reused remote chat as "system prompt changed"
+// and restart the DeepSeek chat on every turn — one orphaned remote chat per
+// turn. Strip the volatile shapes so only real tool/prompt changes matter.
+function stableSystemFingerprint(systemPrompt) {
+    return String(systemPrompt || '')
+        // ISO dates, ISO datetimes (incl. fractional seconds and offset), times.
+        .replace(/\d{4}-\d{2}-\d{2}([T\s]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?/g, '')
+        .replace(/\b\d{1,2}:\d{2}(:\d{2})?\s?(AM|PM|am|pm)?\b/g, '')
+        // Weekdays, month names (capitalized and lowercase forms).
+        .replace(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Monday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/gi, '')
+        .replace(/\b(January|February|March|April|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/gi, '')
+        // Relative-year phrases like "2026" keep risk low; drop bare years near "year".
+        .replace(/\b(19|20)\d{2}\b/g, '')
+        // Run ids and long hex blobs injected into agent prompts.
+        .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '')
+        .replace(/\b0x[0-9a-f]{6,}\b/gi, '');
+}
+
 // Identity of one client message as it is replayed in later requests. The
 // assistant's reasoning is excluded: clients often drop it when echoing.
 function conversationMessageKey(msg) {
@@ -2532,7 +2583,11 @@ function conversationMessageKey(msg) {
 // Re-sending the whole history into an existing chat made the remote context
 // grow quadratically until DeepSeek returned empty answers or "content too
 // long" and lost the tool protocol (#23, #30).
-function planSessionTurn(session, messages, contextKey) {
+function planSessionTurn(session, messages, contextKey, contextRawKey = contextKey) {
+    // contextKey = stableSystemFingerprint hash (chat continuity signal),
+    // contextRawKey = raw systemPrompt hash (whether the client's new system
+    // prompt text has to travel along in a delta turn).
+    const contextRawKeyStable = contextRawKey;
     const conversation = (messages || []).filter(msg => msg && !isSystemRole(msg.role));
     const keys = conversation.map(conversationMessageKey);
     if (!session?.id) return { mode: 'full', reason: null, keys };
@@ -2544,21 +2599,51 @@ function planSessionTurn(session, messages, contextKey) {
     // Clients without explicit history send only their new input (a user
     // message, or a tool result for the previous answer) and rely on the
     // remote chat to remember earlier turns. A changed system prompt (e.g. a
-    // timestamp) is sent along instead of discarding that memory.
+    // timestamp) is sent along instead of discarding that memory: includeSystem
+    // compares the raw prompt, so volatility does not restart the chat while
+    // stableSystemFingerprint keeps the chat itself reusable.
     if (!conversation.some(msg => msg.role === 'assistant')) {
-        return { mode: 'delta', messages: conversation, keys, includeSystem: session.contextKey !== contextKey };
+        return { mode: 'delta', messages: conversation, keys, includeSystem: session.contextRawKey !== contextRawKeyStable };
     }
-    if (session.contextKey !== contextKey) return { mode: 'full', reason: 'system prompt or tools changed', keys };
-    if (sent.length > 0 && sent.length < keys.length && sent.every((key, index) => keys[index] === key)) {
-        // The client echoes the assistant turn DeepSeek just produced; the
-        // remote chat already contains it.
-        let start = sent.length;
-        while (start < conversation.length && conversation[start].role === 'assistant') start++;
-        const delta = conversation.slice(start);
-        if (delta.some(msg => msg.role !== 'assistant')) return { mode: 'delta', messages: delta, keys };
-        return { mode: 'full', reason: 'no new input after the last answer', keys };
+    if (session.contextKey !== contextRawKeyStable) return { mode: 'full', reason: 'system prompt or tools changed', keys };
+    // Alignment walk: assistant turns are the client's echo of replies DeepSeek
+    // itself produced (content may be rewritten), so they never need to be
+    // re-sent. User/tool messages are confirmed one-by-one against the tracked
+    // block; the first unconfirmed message starts the delta. A leading echo
+    // (the client drops old turns but keeps the recent tool rounds) and a
+    // trimmed history therefore both continue the SAME remote chat instead of
+    // forcing a fresh one per turn.
+    let sentIndex = 0;
+    for (let i = 0; i < conversation.length; i++) {
+        if (conversation[i].role === 'assistant') {
+            // The client echoes the assistant turns the remote chat produced,
+            // and plan.keys of the previous turn recorded that echo as sent.
+            // Match it when it lines up; skip silently when the client rewrote
+            // the content — an assistant turn never has to go upstream again.
+            if (sentIndex < sent.length && keys[i] === sent[sentIndex]) sentIndex++;
+            continue;
+        }
+        if (sentIndex < sent.length && keys[i] === sent[sentIndex]) {
+            sentIndex++;
+            continue;
+        }
+        // First message the remote chat has not seen: only it and what follows
+        // must go upstream. The walk reached a non-assistant message here, so
+        // the delta starts exactly at this position.
+        if (sentIndex < sent.length) {
+            // Tracked messages remain unmatched at an unexpected position:
+            // ambiguous mutation/reordering. A fresh chat with the
+            // self-contained prompt keeps the remote protocol coherent.
+            return { mode: 'full', reason: 'conversation history diverged', keys };
+        }
+        // Everything the remote chat holds was confirmed: this is the first
+        // genuinely new message and the delta starts here.
+        return { mode: 'delta', messages: conversation.slice(i), keys };
     }
-    return { mode: 'full', reason: 'conversation history diverged', keys };
+    if (sentIndex < sent.length) {
+        return { mode: 'full', reason: 'conversation history diverged', keys };
+    }
+    return { mode: 'full', reason: 'no new input after the last answer', keys };
 }
 
 function buildDeltaPrompt(deltaMessages, allMessages, toolReminder, maxChars = MAX_UPSTREAM_PROMPT_CHARS, systemPrompt = '') {
@@ -2695,9 +2780,14 @@ const server = http.createServer(async (req, res) => {
         }
         if (agentId === 'all') {
             const count = sessions.size;
+            const retireInfo = [...sessions.entries()].map(([id, session]) => {
+                const pkg = { chatId: session.id, account: accounts.find(a => a.id === session.accountId) };
+                retireRemoteChatById(session.id, session.accountId, `[${id}]`, 'delete all');
+                return pkg;
+            });
             sessions.clear();
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'all_sessions_deleted', count }));
+            res.end(JSON.stringify({ status: 'all_sessions_deleted', count, remote: retireInfo.map(({ account, chatId }) => (account && chatId) ? 'pending' : 'skipped') }));
             return;
         }
         if (!sessions.has(agentId)) {
@@ -2707,11 +2797,20 @@ const server = http.createServer(async (req, res) => {
         }
         const session = sessions.get(agentId);
         const account = accounts.find(a => a.id === session.accountId);
-        const remoteDeleted = account ? 'pending' : false;
-        if (account) {
-            deleteRemoteChat(account, session.id);
-        }
         sessions.delete(agentId);
+        // Report the truth: attempt the remote delete synchronously within the
+        // bounded DS fetch timeout. "pending" would mislead clients into
+        // thinking the remote chat is definitely doomed — it survives until it
+        // succeeds, so say deleted/failed instead.
+        let remoteDeleted = account && session.id ? 'pending' : 'skipped';
+        if (account && session.id) {
+            try {
+                remoteDeleted = await deleteRemoteChat(account, session.id)
+                    ? 'deleted' : 'failed';
+            } catch (e) {
+                remoteDeleted = 'failed';
+            }
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_deleted', agent: agentId, remote_deleted: remoteDeleted }));
         return;
@@ -2832,6 +2931,7 @@ const server = http.createServer(async (req, res) => {
             if (lastUserText === '/new') {
                 const existing = sessions.get(agentId);
                 const historyCount = existing ? existing.history.length : 0;
+                if (existing) retireRemoteChatById(existing.id, existing.accountId, agentTag, '/new reset');
                 sessions.set(agentId, createSession());
                 console.log(`${agentTag} /new received — session reset (history cleared: ${historyCount})`);
                 const confirmation = buildTextResponse('Started a new chat. Session and history have been reset.', '/new', requestedModel);
@@ -2894,8 +2994,9 @@ const server = http.createServer(async (req, res) => {
                 ? ''
                 : buildRecoveryHistoryPrefix(agentSession.history);
             const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, prompt);
-            const contextKey = hashText(systemPrompt);
-            const plan = planSessionTurn(session, messages, contextKey);
+            const contextRawKey = hashText(systemPrompt);
+            const contextKey = hashText(stableSystemFingerprint(systemPrompt));
+            const plan = planSessionTurn(session, messages, contextKey, contextRawKey);
             let fullPrompt;
             let promptCompacted;
             if (plan.mode === 'delta') {
@@ -3323,6 +3424,7 @@ const server = http.createServer(async (req, res) => {
             if (session.id) {
                 session.sentMessageKeys = plan.keys;
                 session.contextKey = contextKey;
+                session.contextRawKey = contextRawKey;
             }
 
             const openaiResponse = toolCall
@@ -3491,6 +3593,7 @@ module.exports = {
         formatToolReminder,
         conversationMessageKey,
         planSessionTurn,
+        stableSystemFingerprint,
         buildDeltaPrompt,
         hashText,
         repairJsonText,
